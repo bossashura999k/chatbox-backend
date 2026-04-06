@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
@@ -13,6 +15,17 @@ app.use(cors({
 
 app.use(express.json());
 app.use(cookieParser());
+
+// =============SYSTEM PROMPT===============
+let systemPromptTemplate = '';
+try {
+  const promptPath = path.join(__dirname, 'system-prompt.txt');
+  systemPromptTemplate = fs.readFileSync(promptPath, 'utf8');
+  console.log('System prompt loaded successfully');
+} catch (err) {
+  console.error('Failed to load system-prompt.txt:', err.message);
+  systemPromptTemplate = 'You are a helpful assistant.'; // fallback
+}
 
 // ========== SIMPLE RATE LIMITER (no extra package needed) ==========
 // Tracks login attempts per IP to block brute-force attacks
@@ -130,15 +143,22 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'No valid messages provided.' });
   }
 
-  // FIX 6: Always inject a server-side system prompt — client cannot override this
+  // Get username from cookie (if exists)
+  let username = 'User';
+  if (req.cookies.username) {
+    try {
+      username = decodeURIComponent(req.cookies.username);
+    } catch(e) { /* fallback */ }
+  }
+
+  // Replace placeholder in the loaded system prompt
+  const systemPrompt = systemPromptTemplate.replace(/{{username}}/g, username);
+
+  // Inject the personalised system prompt
   const messagesWithSystem = [
-    {
-      role: 'system',
-      content: 'You are a helpful AI assistant on Ashura IZZI\'s website (ashura.site). Be friendly, concise, and helpful. Do not discuss harmful, illegal, or inappropriate topics.'
-    },
+    { role: 'system', content: systemPrompt },
     ...sanitized
   ];
-
   const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
   if (!GROQ_API_KEY) {
