@@ -2,21 +2,25 @@ require('dotenv').config();
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
+const helmet = require('helmet');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 
-// CORS configuration: allow your frontend domain
+// ========== SECURITY HEADERS (helmet) ==========
+app.use(helmet());
+
+// ========== CORS ==========
 app.use(cors({
   origin: 'https://ashura.site',
   credentials: true,
 }));
 
 app.use(express.json());
-app.use(cookieParser());
+app.use(cookieParser(process.env.COOKIE_SECRET)); // signed cookies
 
-// =============SYSTEM PROMPT===============
+// ========== SYSTEM PROMPT ==========
 let systemPromptTemplate = '';
 try {
   const promptPath = path.join(__dirname, 'system-prompt.txt');
@@ -24,31 +28,26 @@ try {
   console.log('System prompt loaded successfully');
 } catch (err) {
   console.error('Failed to load system-prompt.txt:', err.message);
-  systemPromptTemplate = 'You are a helpful assistant.'; // fallback
+  systemPromptTemplate = 'You are a helpful assistant.';
 }
 
-// ========== SIMPLE RATE LIMITER (no extra package needed) ==========
-// Tracks login attempts per IP to block brute-force attacks
+// ========== LOGIN RATE LIMITER ==========
 const loginAttempts = new Map();
-const MAX_ATTEMPTS = 5;         // max tries before lockout
-const LOCKOUT_MS = 15 * 60 * 1000; // 15 minute lockout
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
 
-function checkRateLimit(ip) {
+function checkLoginRateLimit(ip) {
   const now = Date.now();
   const record = loginAttempts.get(ip);
-
-  if (!record) return true; // first attempt, allow
-
-  // If lockout period has passed, reset
-  if (now - record.firstAttempt > LOCKOUT_MS) {
+  if (!record) return true;
+  if (now - record.firstAttempt > LOGIN_LOCKOUT_MS) {
     loginAttempts.delete(ip);
     return true;
   }
-
-  return record.count < MAX_ATTEMPTS;
+  return record.count < MAX_LOGIN_ATTEMPTS;
 }
 
-function recordFailedAttempt(ip) {
+function recordFailedLogin(ip) {
   const now = Date.now();
   const record = loginAttempts.get(ip);
   if (!record) {
@@ -58,17 +57,34 @@ function recordFailedAttempt(ip) {
   }
 }
 
-function resetAttempts(ip) {
+function resetLoginAttempts(ip) {
   loginAttempts.delete(ip);
 }
 
-// Clean up old records every 30 minutes so the Map doesn't grow forever
+// ========== CHAT RATE LIMITER ==========
+const chatAttempts = new Map();
+const MAX_CHAT_PER_MIN = 20;
+
+function checkChatRateLimit(ip) {
+  const now = Date.now();
+  const record = chatAttempts.get(ip);
+  if (!record || now - record.window > 60 * 1000) {
+    chatAttempts.set(ip, { count: 1, window: now });
+    return true;
+  }
+  if (record.count >= MAX_CHAT_PER_MIN) return false;
+  record.count++;
+  return true;
+}
+
+// Clean up stale records every 30 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of loginAttempts.entries()) {
-    if (now - record.firstAttempt > LOCKOUT_MS) {
-      loginAttempts.delete(ip);
-    }
+    if (now - record.firstAttempt > LOGIN_LOCKOUT_MS) loginAttempts.delete(ip);
+  }
+  for (const [ip, record] of chatAttempts.entries()) {
+    if (now - record.window > 60 * 1000) chatAttempts.delete(ip);
   }
 }, 30 * 60 * 1000);
 
@@ -77,14 +93,12 @@ setInterval(() => {
 app.post('/api/login', (req, res) => {
   const ip = req.ip;
 
-  // FIX 1: Rate limit login attempts to prevent brute-force
-  if (!checkRateLimit(ip)) {
+  if (!checkLoginRateLimit(ip)) {
     return res.status(429).json({ success: false, error: 'Too many attempts. Try again in 15 minutes.' });
   }
 
   const { username, password } = req.body;
 
-  // FIX 2: Validate that both fields are present and are strings
   if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
     return res.status(400).json({ success: false, error: 'Username and password are required.' });
   }
@@ -93,42 +107,45 @@ app.post('/api/login', (req, res) => {
   const validPass = process.env.ADMIN_PASSWORD;
 
   if (username === validUser && password === validPass) {
-    resetAttempts(ip); // reset counter on success
+    resetLoginAttempts(ip);
     res.cookie('auth', 'true', {
       httpOnly: true,
       secure: true,
       sameSite: 'none',
+      signed: true, // FIX: signed with COOKIE_SECRET — can't be forged
       maxAge: 24 * 60 * 60 * 1000
     });
     res.json({ success: true });
   } else {
-    recordFailedAttempt(ip); // count the failed attempt
+    recordFailedLogin(ip);
     res.status(401).json({ success: false });
   }
 });
 
 
-// ========== CHAT API (only if authenticated) ==========
+// ========== CHAT API ==========
 app.post('/api/chat', async (req, res) => {
-  // Check authentication cookie
-  if (!req.cookies || req.cookies.auth !== 'true') {
+  // FIX: check signed cookie, not plain cookie
+  if (!req.signedCookies || req.signedCookies.auth !== 'true') {
     return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // FIX: rate limit chat requests to protect Groq API budget
+  if (!checkChatRateLimit(req.ip)) {
+    return res.status(429).json({ error: 'Too many requests. Slow down.' });
   }
 
   const { messages } = req.body;
 
-  // FIX 3: Validate messages array
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'Messages array is required' });
   }
 
-  // FIX 4: Cap message history length to avoid huge Groq API bills
   const MAX_MESSAGES = 20;
   if (messages.length > MAX_MESSAGES) {
     return res.status(400).json({ error: `Too many messages. Max ${MAX_MESSAGES} allowed per request.` });
   }
 
-  // FIX 5: Sanitize each message — only allow role + string content
   const allowedRoles = ['user', 'assistant'];
   const sanitized = messages.filter(m =>
     m &&
@@ -136,29 +153,30 @@ app.post('/api/chat', async (req, res) => {
     allowedRoles.includes(m.role) &&
     typeof m.content === 'string' &&
     m.content.trim().length > 0 &&
-    m.content.length <= 4000  // cap individual message length
+    m.content.length <= 4000
   );
 
   if (sanitized.length === 0) {
     return res.status(400).json({ error: 'No valid messages provided.' });
   }
 
-  // Get username from cookie (if exists)
+  // FIX: sanitize username cookie before injecting into system prompt
+  // Strip to alphanumeric + spaces, cap at 30 chars to block prompt injection
   let username = 'User';
   if (req.cookies.username) {
     try {
-      username = decodeURIComponent(req.cookies.username);
-    } catch(e) { /* fallback */ }
+      const raw = decodeURIComponent(req.cookies.username);
+      username = raw.replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 30) || 'User';
+    } catch(e) { /* fallback to 'User' */ }
   }
 
-  // Replace placeholder in the loaded system prompt
   const systemPrompt = systemPromptTemplate.replace(/{{username}}/g, username);
 
-  // Inject the personalised system prompt
   const messagesWithSystem = [
     { role: 'system', content: systemPrompt },
     ...sanitized
   ];
+
   const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
   if (!GROQ_API_KEY) {
@@ -201,7 +219,7 @@ app.post('/api/chat', async (req, res) => {
 
 // ========== VERIFY AUTH ==========
 app.get('/api/verify', (req, res) => {
-  if (req.cookies && req.cookies.auth === 'true') {
+  if (req.signedCookies && req.signedCookies.auth === 'true') {
     res.status(200).json({ authenticated: true });
   } else {
     res.status(401).json({ authenticated: false });
@@ -211,7 +229,7 @@ app.get('/api/verify', (req, res) => {
 
 // ========== LOGOUT ==========
 app.post('/api/logout', (req, res) => {
-  res.clearCookie('auth', { httpOnly: true, secure: true, sameSite: 'none' });
+  res.clearCookie('auth', { httpOnly: true, secure: true, sameSite: 'none', signed: true });
   res.json({ success: true });
 });
 
@@ -230,5 +248,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
-
-// .env added
